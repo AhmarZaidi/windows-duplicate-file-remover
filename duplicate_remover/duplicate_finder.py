@@ -3,7 +3,8 @@ import hashlib
 import queue
 import threading
 import ctypes
-from typing import Dict, List, Tuple, Set, Callable, Optional
+import fnmatch
+from typing import Dict, List, Tuple, Optional
 
 def is_hidden_or_system(filepath: str) -> bool:
     """
@@ -33,12 +34,16 @@ class DuplicateFinderEngine:
     def __init__(self, target_dir: str, event_queue: queue.Queue,
                  match_by_name: bool = False,
                  match_by_ext: bool = False,
-                 skip_system_files: bool = True):
+                 skip_system_files: bool = True,
+                 min_size_bytes: int = 0,
+                 exclude_patterns: Optional[List[str]] = None):
         self.target_dir = os.path.abspath(target_dir)
         self.event_queue = event_queue
         self.match_by_name = match_by_name
         self.match_by_ext = match_by_ext
         self.skip_system_files = skip_system_files
+        self.min_size_bytes = max(0, min_size_bytes)
+        self.exclude_patterns = exclude_patterns or []
         
         self._cancel_event = threading.Event()
         self._thread = None
@@ -128,9 +133,16 @@ class DuplicateFinderEngine:
             # Send update of directory being scanned
             self._post_event('SCAN_DIR', root)
             
-            # Prune hidden or system directories in-place from traversal
+            # Prune hidden/system directories in-place
             if self.skip_system_files:
                 dirs[:] = [d for d in dirs if not is_hidden_or_system(os.path.join(root, d))]
+            
+            # Prune directories matching user-supplied exclude patterns
+            if self.exclude_patterns:
+                dirs[:] = [
+                    d for d in dirs
+                    if not any(fnmatch.fnmatch(d, pat) for pat in self.exclude_patterns)
+                ]
             
             for file in files:
                 if self.is_cancelled():
@@ -144,6 +156,11 @@ class DuplicateFinderEngine:
                     
                 try:
                     file_size = os.path.getsize(filepath)
+                    
+                    # Skip files below minimum size threshold
+                    if file_size < self.min_size_bytes:
+                        continue
+                    
                     if file_size not in size_map:
                         size_map[file_size] = []
                     size_map[file_size].append(filepath)
@@ -153,7 +170,6 @@ class DuplicateFinderEngine:
                         self._post_event('SCAN_FILE_COUNT', file_count)
                         
                 except (OSError, PermissionError):
-                    # Skip locked files or files with permissions issues
                     continue
 
         self._post_event('SCAN_FILE_COUNT', file_count)
