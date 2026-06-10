@@ -16,8 +16,12 @@ def is_hidden_or_system(filepath: str) -> bool:
         return True
         
     try:
-        attrs = ctypes.windll.kernel32.GetFileAttributesW(filepath)
-        if attrs != -1:
+        GetFileAttributesW = ctypes.windll.kernel32.GetFileAttributesW
+        GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+        GetFileAttributesW.restype = ctypes.c_ulong   # DWORD (32-bit unsigned)
+        
+        attrs = GetFileAttributesW(filepath)
+        if attrs != 0xFFFFFFFF:  # INVALID_FILE_ATTRIBUTES
             # FILE_ATTRIBUTE_HIDDEN = 0x02
             # FILE_ATTRIBUTE_SYSTEM = 0x04
             return bool(attrs & (0x02 | 0x04))
@@ -124,6 +128,10 @@ class DuplicateFinderEngine:
             # Send update of directory being scanned
             self._post_event('SCAN_DIR', root)
             
+            # Prune hidden or system directories in-place from traversal
+            if self.skip_system_files:
+                dirs[:] = [d for d in dirs if not is_hidden_or_system(os.path.join(root, d))]
+            
             for file in files:
                 if self.is_cancelled():
                     break
@@ -164,7 +172,8 @@ class DuplicateFinderEngine:
                 self._post_event('HASH_PROGRESS', (processed_count, filepath))
                 
                 try:
-                    hasher = hashlib.md5()
+                    # usedforsecurity=False avoids ValueError on FIPS-mode Python/OpenSSL
+                    hasher = hashlib.md5(usedforsecurity=False)
                     with open(filepath, 'rb') as f:
                         chunk = f.read(8192)  # 8 KB partial read
                         hasher.update(chunk)
@@ -174,7 +183,7 @@ class DuplicateFinderEngine:
                     if key not in partial_map:
                         partial_map[key] = []
                     partial_map[key].append(filepath)
-                except (OSError, PermissionError):
+                except (OSError, PermissionError, ValueError):
                     pass
                 
                 processed_count += 1
@@ -195,9 +204,9 @@ class DuplicateFinderEngine:
                 self._post_event('HASH_PROGRESS', (processed_count, filepath))
                 
                 try:
-                    hasher = hashlib.md5()
+                    # usedforsecurity=False avoids ValueError on FIPS-mode Python/OpenSSL
+                    hasher = hashlib.md5(usedforsecurity=False)
                     with open(filepath, 'rb') as f:
-                        # Read in 64KB blocks
                         for chunk in iter(lambda: f.read(65536), b''):
                             if self.is_cancelled():
                                 return {}
@@ -208,7 +217,7 @@ class DuplicateFinderEngine:
                     if key not in full_map:
                         full_map[key] = []
                     full_map[key].append(filepath)
-                except (OSError, PermissionError):
+                except (OSError, PermissionError, ValueError):
                     pass
                 
                 processed_count += 1
@@ -226,7 +235,6 @@ class DuplicateFinderEngine:
             if self.is_cancelled():
                 break
                 
-            # If no secondary metrics are selected, the entire group is a duplicate group
             if not self.match_by_name and not self.match_by_ext:
                 final_list.append({
                     'size': size,
@@ -235,13 +243,11 @@ class DuplicateFinderEngine:
                 })
                 continue
                 
-            # We need to sub-group based on name and/or extension
             sub_groups = {}
             for filepath in paths:
                 filename = os.path.basename(filepath)
                 name_part, ext_part = os.path.splitext(filename)
                 
-                # Build sub-group key
                 key_parts = []
                 if self.match_by_name:
                     key_parts.append(name_part.lower())
@@ -253,7 +259,6 @@ class DuplicateFinderEngine:
                     sub_groups[sub_key] = []
                 sub_groups[sub_key].append(filepath)
                 
-            # Keep sub-groups that have at least 2 files
             for sub_key, sub_paths in sub_groups.items():
                 if len(sub_paths) >= 2:
                     final_list.append({
@@ -262,6 +267,5 @@ class DuplicateFinderEngine:
                         'files': sub_paths
                     })
                     
-        # Sort groups so larger file sizes appear first
         final_list.sort(key=lambda g: g['size'], reverse=True)
         return final_list

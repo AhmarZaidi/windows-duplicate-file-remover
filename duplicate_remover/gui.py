@@ -6,69 +6,103 @@ import subprocess
 from datetime import datetime
 import winreg
 
-# Try to import PIL for enhanced image preview capabilities (supports JPG, BMP, etc.)
-try:
-    from PIL import Image, ImageTk
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
+from PIL import Image, ImageTk, ImageDraw
 
-import utils
-from duplicate_finder import DuplicateFinderEngine
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+
+import duplicate_remover.utils as utils
+from duplicate_remover.duplicate_finder import DuplicateFinderEngine
 
 # Color Palettes
 DARK_THEME = {
-    'bg': '#14141f',
-    'card_bg': '#1e1e2d',
-    'text': '#f3f4f6',
-    'muted_text': '#9ca3af',
-    'border': '#2d2d3f',
-    'accent': '#3b82f6',
-    'accent_hover': '#2563eb',
-    'success': '#10b981',
-    'danger': '#ef4444',
-    'select_bg': '#3b82f6',
+    'bg': '#1e1e1e',
+    'card_bg': '#2d2d2d',
+    'text': '#ffffff',
+    'muted_text': '#aaaaaa',
+    'border': '#3f3f3f',
+    'accent': '#0078d4',          # Windows 11 Blue
+    'accent_hover': '#106ebe',
+    'success': '#107c41',         # Success Green
+    'danger': '#a80000',          # Danger Red
+    'select_bg': '#0078d4',
     'select_fg': '#ffffff',
+    'checked_bg': '#2a3a4e',       # Dark blue-gray checked row highlight
+    'group_header_bg': '#252525', # Dark group divider background
 }
 
 LIGHT_THEME = {
-    'bg': '#f3f4f6',
+    'bg': '#f3f3f3',
     'card_bg': '#ffffff',
-    'text': '#111827',
-    'muted_text': '#6b7280',
-    'border': '#e5e7eb',
-    'accent': '#3b82f6',
-    'accent_hover': '#1d4ed8',
-    'success': '#10b981',
-    'danger': '#ef4444',
-    'select_bg': '#3b82f6',
+    'text': '#000000',
+    'muted_text': '#666666',
+    'border': '#d2d2d2',
+    'accent': '#0078d4',
+    'accent_hover': '#106ebe',
+    'success': '#107c41',
+    'danger': '#a80000',
+    'select_bg': '#0078d4',
     'select_fg': '#ffffff',
+    'checked_bg': '#e0f2fe',       # Soft light blue checked row highlight
+    'group_header_bg': '#e5e5e5', # Light group divider background
 }
 
-def get_windows_system_theme() -> str:
-    """Queries the Windows registry to check if Dark Mode is active."""
-    try:
-        registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
-        key = winreg.OpenKey(registry, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-        return "light" if value == 1 else "dark"
-    except Exception:
-        return "dark"  # Default fallback
+class ScrollableFrame(ttk.Frame):
+    """
+    A generic scrollable container using Canvas. Perfect for details panes that can overflow.
+    """
+    def __init__(self, container, *args, **kwargs):
+        super().__init__(container, *args, **kwargs)
+        
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas)
+        
+        # Configure scrollregion dynamically on size configuration
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            )
+        )
+        
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        
+        # Auto-adjust frame width to fill canvas
+        self.canvas.bind('<Configure>', self._on_canvas_configure)
+        
+        # Bind mousewheel scroll
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        bbox = self.canvas.bbox("all")
+        canvas_height = self.canvas.winfo_height()
+        if bbox and bbox[3] - bbox[1] > canvas_height:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+# --- MAIN APP VIEW ---
 
 class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Duplicate File Remover")
-        
-        # Sizing: Increase starting geometry to avoid truncation and fit the preview pane
         self.geometry("1000x700")
-        self.minsize(950, 650)
         self.configure(bg=DARK_THEME['bg'])
+        self.minsize(950, 650)
         
-        # Center window
         self.eval('tk::PlaceWindow . center')
         
-        # State
+        # Core State
         self.event_queue = queue.Queue()
         self.finder = None
         self.scanning = False
@@ -77,14 +111,18 @@ class MainWindow(tk.Tk):
         self.current_theme = "system"
         self.palette = DARK_THEME
         
-        # Setup persistent global header bar (contains app title and theme selector)
+        # Checkbox assets (drawn programmatically)
+        self.unchecked_img = None
+        self.checked_img = None
+        self._generate_checkbox_images()
+        
+        # Persistent header & controls
         self._create_header_bar()
         
-        # Container frame for switching screens
+        # Switching Screens container
         self.container = tk.Frame(self, bg=DARK_THEME['bg'])
-        self.container.pack(fill="both", expand=True, padx=20, pady=(10, 20))
+        self.container.pack(fill="both", expand=True, padx=20, pady=(5, 20))
         
-        # Initialize screens
         self.screens = {}
         for F in (SetupScreen, ProgressScreen, ResultsScreen):
             screen_name = F.__name__
@@ -95,87 +133,113 @@ class MainWindow(tk.Tk):
         self.container.grid_rowconfigure(0, weight=1)
         self.container.grid_columnconfigure(0, weight=1)
         
-        # Initialize theme to system default
         self.apply_theme("system")
-        
         self.show_screen("SetupScreen")
 
+    def _generate_checkbox_images(self):
+        """Generates checkbox image assets at runtime using PIL."""
+        img_un = Image.new("RGBA", (14, 14), (255, 255, 255, 0))
+        draw_un = ImageDraw.Draw(img_un)
+        draw_un.rounded_rectangle([0, 0, 13, 13], radius=2, outline=(140, 140, 140), width=1, fill=(255, 255, 255, 0))
+        self.unchecked_img = ImageTk.PhotoImage(img_un)
+        
+        img_ch = Image.new("RGBA", (14, 14), (255, 255, 255, 0))
+        draw_ch = ImageDraw.Draw(img_ch)
+        draw_ch.rounded_rectangle([0, 0, 13, 13], radius=2, outline=(0, 120, 212), width=1, fill=(0, 120, 212))
+        draw_ch.line([(3, 6), (6, 9), (10, 3)], fill=(255, 255, 255), width=2)
+        self.checked_img = ImageTk.PhotoImage(img_ch)
+
     def _create_header_bar(self):
-        """Creates a top persistent header with title and theme selector dropdown."""
+        """Creates persistent title and theme toggle buttons."""
         self.header_frame = tk.Frame(self, bg=DARK_THEME['bg'], height=45)
         self.header_frame.pack(fill="x", padx=20, pady=(15, 5))
         
-        # App Title & Icon Symbol
         title_lbl = tk.Label(self.header_frame, text="📁 Windows Duplicate Remover", 
                              font=("Segoe UI", 12, "bold"), fg=DARK_THEME['text'], bg=DARK_THEME['bg'])
         title_lbl.pack(side="left")
         
-        # Theme controls container
-        theme_container = tk.Frame(self.header_frame, bg=DARK_THEME['bg'])
-        theme_container.pack(side="right")
+        toggle_wrapper = tk.Frame(self.header_frame, bg=DARK_THEME['bg'])
+        toggle_wrapper.pack(side="right")
         
-        theme_lbl = tk.Label(theme_container, text="Theme:", font=("Segoe UI", 9), 
+        theme_lbl = tk.Label(toggle_wrapper, text="Theme:", font=("Segoe UI", 9), 
                              fg=DARK_THEME['muted_text'], bg=DARK_THEME['bg'])
-        theme_lbl.pack(side="left", padx=(0, 5))
+        theme_lbl.pack(side="left", padx=(0, 8))
         
-        self.theme_var = tk.StringVar(value="System")
-        self.theme_combo = ttk.Combobox(theme_container, textvariable=self.theme_var, 
-                                        values=["System", "Dark", "Light"], width=10, state="readonly")
-        self.theme_combo.pack(side="left")
-        self.theme_combo.bind("<<ComboboxSelected>>", self.on_theme_changed)
+        # Horizontal Segmented Toggle Frame
+        self.toggle_frame = tk.Frame(toggle_wrapper, bd=1, relief="solid")
+        self.toggle_frame.pack(side="left")
+        
+        self.toggle_btns = {}
+        for theme_opt in ["Light", "Dark", "System"]:
+            btn = tk.Button(self.toggle_frame, text=theme_opt, font=("Segoe UI", 8, "bold"),
+                            relief="flat", bd=0, padx=8, pady=3, cursor="hand2",
+                            command=lambda t=theme_opt: self.select_toggle_theme(t))
+            btn.pack(side="left")
+            self.toggle_btns[theme_opt.lower()] = btn
 
-    def on_theme_changed(self, event=None):
-        selected_theme = self.theme_var.get().lower()
-        self.apply_theme(selected_theme)
+    def select_toggle_theme(self, theme_opt):
+        self.apply_theme(theme_opt.lower())
 
     def apply_theme(self, theme_name):
         self.current_theme = theme_name
         
         if theme_name == "system":
-            sys_theme = get_windows_system_theme()
+            sys_theme = utils.get_windows_system_theme()
             self.palette = DARK_THEME if sys_theme == "dark" else LIGHT_THEME
         else:
             self.palette = DARK_THEME if theme_name == "dark" else LIGHT_THEME
             
-        # Update Ttk Styles
         self._update_ttk_styles(self.palette)
-        
-        # Apply theme colors recursively to all standard Tkinter widgets
         self.configure(bg=self.palette['bg'])
+        
+        # Update Segmented toggle buttons highlight states
+        self.toggle_frame.configure(bg=self.palette['border'], highlightbackground=self.palette['border'])
+        for key, btn in self.toggle_btns.items():
+            if key == theme_name:
+                btn.configure(bg=self.palette['accent'], fg=self.palette['select_fg'], 
+                              activebackground=self.palette['accent_hover'], activeforeground=self.palette['select_fg'])
+            else:
+                btn.configure(bg=self.palette['card_bg'], fg=self.palette['muted_text'],
+                              activebackground=self.palette['card_bg'], activeforeground=self.palette['text'])
+        
+        # Apply palette recursively to standard widgets
         self._apply_theme_to_widget_tree(self, self.palette)
+        
+        # Explicitly update ResultsScreen tree tags if it exists
+        if "ResultsScreen" in self.screens:
+            self.screens["ResultsScreen"].update_theme(self.palette)
 
     def _update_ttk_styles(self, palette):
         style = ttk.Style()
         style.theme_use("clam")
         
-        # General configurations
         style.configure("TFrame", background=palette['bg'])
         style.configure("Card.TFrame", background=palette['card_bg'], borderwidth=1, relief="solid", bordercolor=palette['border'])
         style.configure("TLabel", background=palette['bg'], foreground=palette['text'])
         
         # Custom button styles
-        style.configure("TButton", font=("Segoe UI", 10, "bold"), background=palette['accent'], foreground=palette['text'], borderwidth=0, padding=8)
+        style.configure("TButton", font=("Segoe UI", 10, "bold"), background=palette['accent'], foreground=palette['select_fg'], borderwidth=0, padding=8)
         style.map("TButton", 
                   background=[("active", palette['accent_hover']), ("disabled", palette['border'])],
                   foreground=[("disabled", palette['muted_text'])])
         
-        style.configure("Primary.TButton", background=palette['success'], foreground=palette['text'])
+        style.configure("Primary.TButton", background=palette['success'], foreground=palette['select_fg'])
         style.map("Primary.TButton", background=[("active", "#059669")])
         
-        style.configure("Danger.TButton", background=palette['danger'], foreground=palette['text'])
+        style.configure("Danger.TButton", background=palette['danger'], foreground=palette['select_fg'])
         style.map("Danger.TButton", background=[("active", "#dc2626")])
         
         style.configure("Secondary.TButton", background=palette['border'], foreground=palette['text'])
         style.map("Secondary.TButton", background=[("active", palette['card_bg'])])
 
         # Checkbutton
-        style.configure("TCheckbutton", background=palette['card_bg'], foreground=palette['text'], font=("Segoe UI", 10))
+        style.configure("TCheckbutton", background=palette['card_bg'], foreground=palette['text'], font=("Segoe UI", 9))
         style.map("TCheckbutton", 
                   background=[("active", palette['card_bg'])],
                   foreground=[("active", palette['text'])])
 
         # Progressbar
-        style.configure("TProgressbar", thickness=15, troughcolor=palette['bg'], background=palette['accent'], borderwidth=0)
+        style.configure("TProgressbar", troughcolor=palette['bg'], background=palette['accent'], borderwidth=0)
         
         # Treeview
         style.configure("Treeview", 
@@ -196,14 +260,13 @@ class MainWindow(tk.Tk):
                   foreground=[("selected", palette['select_fg'])])
 
     def _apply_theme_to_widget_tree(self, widget, palette):
-        """Recursively updates standard non-ttk Tkinter widgets in the app hierarchy."""
         w_class = widget.winfo_class()
         
-        # Apply standard configurations based on tags and widgets
         if w_class == "Frame":
-            # Determine if it's the top persistent header bar or a card frame
             if widget == self.header_frame:
                 widget.configure(bg=palette['bg'])
+            elif widget == self.toggle_frame:
+                widget.configure(bg=palette['border'])
             else:
                 style_type = getattr(widget, "custom_style", "normal")
                 bg = palette['card_bg'] if style_type == "card" else palette['bg']
@@ -230,10 +293,13 @@ class MainWindow(tk.Tk):
             widget.configure(bg=palette['card_bg'], fg=palette['text'], 
                              activebackground=palette['accent'], activeforeground=palette['text'])
                              
-        elif w_class == "Text":  # Text snippet preview box
+        elif w_class == "Text":
             widget.configure(bg=palette['bg'], fg=palette['text'], 
                              insertbackground=palette['text'], relief="flat")
         
+        elif w_class == "Canvas":
+            widget.configure(bg=palette['card_bg'], highlightthickness=0)
+
         # Recurse children
         for child in widget.winfo_children():
             self._apply_theme_to_widget_tree(child, palette)
@@ -246,6 +312,10 @@ class MainWindow(tk.Tk):
     def start_scan(self, directory, match_name, match_ext, skip_sys):
         self.scanning = True
         self.selected_files.clear()
+        
+        # Re-initialize the event queue to clear any stale events from a previous scan
+        self.event_queue = queue.Queue()
+        
         self.show_screen("ProgressScreen")
         
         self.finder = DuplicateFinderEngine(
@@ -312,11 +382,7 @@ class SetupScreen(ttk.Frame):
         self.controller = controller
         self.configure(style="TFrame")
         
-        # Layout weights
-        self.columnconfigure(0, weight=1)
-        
-        # Title Banner (Paddings compacted to guarantee visibility of bottom buttons on small screens)
-        title_lbl = tk.Label(self, text="Scan New Directory", font=("Segoe UI", 16, "bold"))
+        title_lbl = tk.Label(self, text="Scan New Directory", font=("Segoe UI", 15, "bold"))
         title_lbl.custom_style = "title"
         title_lbl.pack(anchor="w", pady=(5, 2))
         
@@ -341,10 +407,10 @@ class SetupScreen(ttk.Frame):
         self.path_entry = tk.Entry(selector_inner, textvariable=self.path_var, font=("Segoe UI", 10))
         self.path_entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 10))
         
-        browse_btn = ttk.Button(selector_inner, text="Browse...", command=self.browse_folder, style="TButton")
-        browse_btn.pack(side="right")
+        self.browse_btn = ttk.Button(selector_inner, text="Browse...", command=self.browse_folder, style="Secondary.TButton")
+        self.browse_btn.pack(side="right")
         
-        # Options Card (Paddings and spacings compacted)
+        # Options Card
         options_frame = ttk.Frame(self, style="Card.TFrame", padding=12)
         options_frame.custom_style = "card"
         options_frame.pack(fill="x", pady=10)
@@ -413,7 +479,7 @@ class ProgressScreen(ttk.Frame):
         self.controller = controller
         self.configure(style="TFrame")
         
-        self.title_lbl = tk.Label(self, text="Scanning Files...", font=("Segoe UI", 16, "bold"))
+        self.title_lbl = tk.Label(self, text="Scanning Files...", font=("Segoe UI", 15, "bold"))
         self.title_lbl.custom_style = "title"
         self.title_lbl.pack(anchor="w", pady=(5, 2))
         
@@ -445,8 +511,8 @@ class ProgressScreen(ttk.Frame):
         self.total_files_lbl.custom_style = "card"
         self.total_files_lbl.pack(anchor="w", pady=2)
         
-        cancel_btn = ttk.Button(self, text="Cancel Scan ⏹", command=self.controller.cancel_scan, style="Danger.TButton")
-        cancel_btn.pack(anchor="e", pady=15)
+        self.cancel_btn = ttk.Button(self, text="Cancel Scan ⏹", command=self.controller.cancel_scan, style="Danger.TButton")
+        self.cancel_btn.pack(anchor="e", pady=15)
         self.total_to_hash = 0
 
     def on_show(self):
@@ -496,7 +562,6 @@ class ResultsScreen(ttk.Frame):
         self.controller = controller
         self.configure(style="TFrame")
         
-        # Local image references to keep Garbage Collector from cleaning them
         self._preview_image_ref = None
         self.preview_visible = True
         
@@ -504,7 +569,7 @@ class ResultsScreen(ttk.Frame):
         top_bar = tk.Frame(self)
         top_bar.pack(fill="x", pady=(5, 5))
         
-        title_lbl = tk.Label(top_bar, text="Scan Results", font=("Segoe UI", 16, "bold"))
+        title_lbl = tk.Label(top_bar, text="Scan Results", font=("Segoe UI", 15, "bold"))
         title_lbl.custom_style = "title"
         title_lbl.pack(side="left")
         
@@ -515,7 +580,7 @@ class ResultsScreen(ttk.Frame):
         self.summary_lbl.custom_style = "muted"
         self.summary_lbl.pack(anchor="w", pady=(0, 8))
         
-        # Main body container - Holds results list & details side-by-side
+        # Main body container
         self.body_container = tk.Frame(self)
         self.body_container.pack(fill="both", expand=True)
         
@@ -524,7 +589,7 @@ class ResultsScreen(ttk.Frame):
         self.left_pane.custom_style = "card"
         self.left_pane.pack(side="left", fill="both", expand=True, padx=(0, 10))
         
-        self.tree = ttk.Treeview(self.left_pane, columns=("size", "date", "status"), selectmode="extended")
+        self.tree = ttk.Treeview(self.left_pane, columns=("size", "date", "status"), selectmode="browse")
         self.tree.heading("#0", text="Path Difference / Base Directory", anchor="w")
         self.tree.heading("size", text="Size", anchor="e")
         self.tree.heading("date", text="Date Modified", anchor="w")
@@ -546,10 +611,10 @@ class ResultsScreen(ttk.Frame):
         self.left_pane.grid_rowconfigure(0, weight=1)
         self.left_pane.grid_columnconfigure(0, weight=1)
         
-        # Bindings
-        self.tree.bind("<Double-1>", self.on_double_click)
+        self.tree.bind("<Button-1>", self.on_click_tree)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Button-3>", self.show_context_menu)
+        self.tree.bind("<space>", lambda e: self.toggle_selected_row())
         
         # Context Menu
         self.context_menu = tk.Menu(self, tearoff=0)
@@ -559,38 +624,39 @@ class ResultsScreen(ttk.Frame):
         self.context_menu.add_command(label="Toggle Selection", command=self.toggle_selected_row)
         
         # 2. Right Panel: Collapsable Preview Pane
-        self.preview_pane = ttk.Frame(self.body_container, style="Card.TFrame", padding=15, width=280)
+        self.preview_pane = ttk.Frame(self.body_container, style="Card.TFrame", width=280)
         self.preview_pane.custom_style = "card"
         self.preview_pane.pack(side="right", fill="both", expand=False)
-        self.preview_pane.pack_propagate(False)  # Lock width to 280px
+        self.preview_pane.pack_propagate(False)
         
-        # Details Panel elements
-        self.preview_title = tk.Label(self.preview_pane, text="File Details", font=("Segoe UI", 11, "bold"))
+        self.scroll_preview = ScrollableFrame(self.preview_pane)
+        self.scroll_preview.pack(fill="both", expand=True)
+        
+        self.inner_preview = self.scroll_preview.scrollable_frame
+        self.inner_preview.custom_style = "card"
+        
+        self.preview_title = tk.Label(self.inner_preview, text="File Details", font=("Segoe UI", 11, "bold"))
         self.preview_title.custom_style = "card"
         self.preview_title.pack(anchor="w", pady=(0, 10))
         
-        # Image Display Area (Label inside frame to allow centering)
-        self.media_frame = tk.Frame(self.preview_pane, bd=1, relief="solid", bg="#000000", height=160)
+        self.media_frame = tk.Frame(self.inner_preview, bd=1, relief="solid", bg="#000000", height=160)
         self.media_frame.pack(fill="x", pady=(0, 10))
         self.media_frame.pack_propagate(False)
         
         self.media_lbl = tk.Label(self.media_frame, text="No Media Preview", font=("Segoe UI", 9, "italic"), fg="#888888", bg="#000000")
         self.media_lbl.pack(expand=True, fill="both")
         
-        # Snippet Box (For text files)
-        self.snippet_lbl = tk.Label(self.preview_pane, text="Text Snippet:", font=("Segoe UI", 9, "bold"))
+        self.snippet_lbl = tk.Label(self.inner_preview, text="Text Snippet:", font=("Segoe UI", 9, "bold"))
         self.snippet_lbl.custom_style = "card"
         
-        self.snippet_frame = tk.Frame(self.preview_pane, bd=1, relief="solid")
+        self.snippet_frame = tk.Frame(self.inner_preview, bd=1, relief="solid")
         self.snippet_text = tk.Text(self.snippet_frame, height=7, font=("Consolas", 8), wrap="char")
         self.snippet_vsb = ttk.Scrollbar(self.snippet_frame, orient="vertical", command=self.snippet_text.yview)
         self.snippet_text.configure(yscrollcommand=self.snippet_vsb.set)
-        
         self.snippet_text.pack(side="left", fill="both", expand=True)
         self.snippet_vsb.pack(side="right", fill="y")
         
-        # Metadata labels
-        self.meta_frame = tk.Frame(self.preview_pane)
+        self.meta_frame = tk.Frame(self.inner_preview)
         self.meta_frame.custom_style = "card"
         self.meta_frame.pack(fill="both", expand=True, pady=(5, 0))
         
@@ -598,7 +664,7 @@ class ResultsScreen(ttk.Frame):
         self.meta_lbl.custom_style = "card"
         self.meta_lbl.pack(fill="both", expand=True)
         
-        # Selection / Action Panel (Paddings and sizing compacted)
+        # Selection / Action Panel
         actions_bar = tk.Frame(self)
         actions_bar.pack(fill="x", pady=(10, 5))
         
@@ -606,24 +672,21 @@ class ResultsScreen(ttk.Frame):
         select_lbl.custom_style = "muted"
         select_lbl.pack(side="left", padx=(0, 8))
         
-        all_but_one_btn = ttk.Button(actions_bar, text="Keep Oldest", 
-                                     command=lambda: self.select_all_but_one(keep="oldest"), style="Secondary.TButton")
-        all_but_one_btn.pack(side="left", padx=3)
+        self.all_but_one_btn = ttk.Button(actions_bar, text="Keep Oldest", command=lambda: self.select_all_but_one(keep="oldest"), style="Secondary.TButton")
+        self.all_but_one_btn.pack(side="left", padx=3)
 
-        all_but_one_newest_btn = ttk.Button(actions_bar, text="Keep Newest", 
-                                             command=lambda: self.select_all_but_one(keep="newest"), style="Secondary.TButton")
-        all_but_one_newest_btn.pack(side="left", padx=3)
+        self.all_but_one_newest_btn = ttk.Button(actions_bar, text="Keep Newest", command=lambda: self.select_all_but_one(keep="newest"), style="Secondary.TButton")
+        self.all_but_one_newest_btn.pack(side="left", padx=3)
         
-        deselect_all_btn = ttk.Button(actions_bar, text="Clear Select", 
-                                       command=self.deselect_all, style="Secondary.TButton")
-        deselect_all_btn.pack(side="left", padx=3)
+        self.deselect_all_btn = ttk.Button(actions_bar, text="Clear Select", command=self.deselect_all, style="Secondary.TButton")
+        self.deselect_all_btn.pack(side="left", padx=3)
 
-        # Bottom Frame for exit actions
+        # Bottom Frame
         bottom_frame = tk.Frame(self)
         bottom_frame.pack(fill="x", pady=(10, 0))
         
-        back_btn = ttk.Button(bottom_frame, text="⬅ Scan Another Folder", command=self.go_back, style="Secondary.TButton")
-        back_btn.pack(side="left")
+        self.back_btn = ttk.Button(bottom_frame, text="⬅ Scan Another Folder", command=self.go_back, style="Secondary.TButton")
+        self.back_btn.pack(side="left")
         
         self.delete_btn = ttk.Button(bottom_frame, text="Delete Selected (0 files) 🗑️", command=self.delete_selected, style="Danger.TButton")
         self.delete_btn.pack(side="right")
@@ -638,12 +701,16 @@ class ResultsScreen(ttk.Frame):
             self.preview_toggle_btn.configure(text="Hide Details Panel ◀")
             self.preview_visible = True
 
+    def update_theme(self, palette):
+        self.tree.tag_configure("checked", background=palette['checked_bg'], foreground=palette['text'])
+        self.tree.tag_configure("unchecked", background=palette['card_bg'], foreground=palette['text'])
+        self.tree.tag_configure("group_header", background=palette['group_header_bg'], foreground=palette['text'], font=("Segoe UI", 9, "bold"))
+
     def on_show(self):
-        # Refresh tree items
         self.tree.delete(*self.tree.get_children())
-        
-        # Reset Preview
         self.clear_preview()
+        
+        self.update_theme(self.controller.palette)
         
         results = self.controller.scan_results
         total_groups = len(results)
@@ -658,8 +725,6 @@ class ResultsScreen(ttk.Frame):
             total_dup_files += dups_in_group
             total_redundant_size += dups_in_group * group_size
             
-            # --- PATH DIFFERENTIATION LOGIC ---
-            # Calculate the longest common path prefix among all duplicate copies in the group.
             try:
                 base_path = os.path.commonpath(files)
             except Exception:
@@ -667,15 +732,14 @@ class ResultsScreen(ttk.Frame):
             
             formatted_size = utils.format_size(group_size)
             
-            # Render base path clearly in the header row
             if base_path:
-                header_name = f"Group #{index + 1} | Base: {base_path} | {len(files)} files"
+                header_name = f"Group #{index + 1} | Base: {base_path} | {len(files)} files ({formatted_size} each)"
             else:
                 header_name = f"Group #{index + 1} | Size: {formatted_size} | {len(files)} files"
                 
-            header_id = self.tree.insert("", "end", text=header_name, values=(formatted_size, "", ""), open=True)
+            header_id = self.tree.insert("", "end", text=header_name, values=(formatted_size, "", ""), 
+                                         open=True, tags=("group_header",))
             
-            # Add Child File Rows using only their relative paths from the base prefix!
             for filepath in files:
                 mtime_str = ""
                 try:
@@ -685,20 +749,14 @@ class ResultsScreen(ttk.Frame):
                     pass
                 
                 if base_path:
-                    # Show relative path from base prefix so they are short and show where they differ
                     display_path = os.path.relpath(filepath, base_path)
                 else:
                     display_path = filepath
                     
-                child_id = self.tree.insert(header_id, "end", text=display_path, values=(formatted_size, mtime_str, "[ ]"))
-                # Store full absolute path inside a tag or custom item value mapping to make queries accurate
-                self.tree.set(child_id, "status", "[ ]")
-                # Bind the absolute path as a key to retrieve the actual file
-                self.tree.tag_bind(child_id, "abspath", filepath)
-                # Save the mapping of child_id to full filepath
-                self.tree.item(child_id, tags=(filepath,))
+                # Insert row initialized as unchecked and save path as 4th element in values (Select status is Unicode '☐')
+                self.tree.insert(header_id, "end", text=display_path, values=(formatted_size, mtime_str, "☐", filepath), 
+                                  tags=("unchecked",))
                 
-        # Update summary text
         formatted_redundant_size = utils.format_size(total_redundant_size)
         self.summary_lbl.configure(
             text=f"Found {total_groups:,} duplicate groups. Redundant files: {total_dup_files:,} ({formatted_redundant_size} wasting space)"
@@ -712,22 +770,33 @@ class ResultsScreen(ttk.Frame):
         else:
             self.delete_btn.configure(text="Delete Selected (0 files) 🗑️", state="disabled")
 
-    def on_double_click(self, event):
+    def on_click_tree(self, event):
         item_id = self.tree.identify_row(event.y)
         if not item_id or self.tree.parent(item_id) == "":
             return
-        self.toggle_row_selection(item_id)
+            
+        # Only toggle checked state if the user clicks in the "Select" column (column "#3")
+        column = self.tree.identify_column(event.x)
+        if column == "#3":
+            self.toggle_row_selection(item_id)
 
     def toggle_row_selection(self, item_id):
-        # Retrieve full path stored in the tag list
-        filepath = self.tree.item(item_id, "tags")[0]
-        current_status = self.tree.set(item_id, "status")
+        # Retrieve path from values
+        vals = list(self.tree.item(item_id, "values"))
+        if len(vals) <= 3:
+            return
+        filepath = vals[3]
         
-        if current_status == "[ ]":
-            self.tree.set(item_id, "status", "[x]")
+        tags = self.tree.item(item_id, "tags")
+        status = tags[0] if tags else "unchecked"
+        
+        if status == "unchecked":
+            vals[2] = "☑"
+            self.tree.item(item_id, values=vals, tags=("checked",))
             self.controller.selected_files.add(filepath)
         else:
-            self.tree.set(item_id, "status", "[ ]")
+            vals[2] = "☐"
+            self.tree.item(item_id, values=vals, tags=("unchecked",))
             self.controller.selected_files.discard(filepath)
             
         self.update_delete_button_state()
@@ -761,7 +830,8 @@ class ResultsScreen(ttk.Frame):
         item_id = selected[0]
         if self.tree.parent(item_id) == "":
             return None
-        return self.tree.item(item_id, "tags")[0]
+        vals = self.tree.item(item_id, "values")
+        return vals[3] if len(vals) > 3 else None
 
     def open_file(self):
         path = self.get_selected_file_path()
@@ -780,12 +850,10 @@ class ResultsScreen(ttk.Frame):
                 messagebox.showerror("Error", f"Could not open folder:\n{e}")
 
     def on_tree_select(self, event):
-        """Fires when user selects a file in the list. Updates the preview pane."""
         path = self.get_selected_file_path()
         if not path:
             self.clear_preview()
             return
-            
         self.update_preview_pane(path)
 
     def clear_preview(self):
@@ -805,58 +873,60 @@ class ResultsScreen(ttk.Frame):
         _, ext = os.path.splitext(filename)
         ext = ext.lower()
         
-        # Show Basic Metadata Details
         try:
             size_b = os.path.getsize(filepath)
             size_fmt = utils.format_size(size_b)
             mtime = os.path.getmtime(filepath)
             mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
         except Exception as e:
-            self.meta_lbl.configure(text=f"Error reading file details:\n{e}")
+            self.meta_lbl.configure(text=f"Error reading details:\n{e}")
             return
             
         metadata_text = f"Name: {filename}\nSize: {size_fmt}\nModified: {mtime_str}\n\nFull Path:\n{filepath}"
         self.meta_lbl.configure(text=metadata_text, font=("Segoe UI", 9))
         
-        # Image Preview Loading
-        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"}
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}
         text_exts = {".txt", ".py", ".log", ".json", ".ini", ".cfg", ".xml", ".html", ".css", ".md", ".csv", ".bat", ".sh"}
         
         if ext in image_exts:
-            photo = None
-            if PIL_AVAILABLE:
-                try:
-                    img = Image.open(filepath)
-                    # Downscale to fit media box: max dimensions 240 width, 150 height
-                    img.thumbnail((240, 150))
-                    photo = ImageTk.PhotoImage(img)
-                except Exception:
-                    pass
-            else:
-                # Fallback to native PhotoImage (supports PNG/GIF natively)
-                if ext in {".png", ".gif"}:
-                    try:
-                        native_photo = tk.PhotoImage(file=filepath)
-                        w, h = native_photo.width(), native_photo.height()
-                        # Apply simple subsampling factor
-                        factor = max(1, w // 240, h // 150)
-                        if factor > 1:
-                            native_photo = native_photo.subsample(factor, factor)
-                        photo = native_photo
-                    except Exception:
-                        pass
-                        
-            if photo:
+            try:
+                img = Image.open(filepath)
+                img.thumbnail((240, 150))
+                photo = ImageTk.PhotoImage(img)
                 self.media_lbl.configure(image=photo, text="")
-                self._preview_image_ref = photo  # Keep reference
+                self._preview_image_ref = photo
+            except Exception as e:
+                self.media_lbl.configure(text=f"Image preview error:\n{e}")
+                
+        elif ext in video_exts:
+            if OPENCV_AVAILABLE:
+                try:
+                    cap = cv2.VideoCapture(filepath)
+                    if cap.isOpened():
+                        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        frame_idx = min(24, total // 2) if total > 0 else 0
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        success, frame = cap.read()
+                        cap.release()
+                        
+                        if success:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            img = Image.fromarray(frame_rgb)
+                            img.thumbnail((240, 150))
+                            photo = ImageTk.PhotoImage(img)
+                            self.media_lbl.configure(image=photo, text="")
+                            self._preview_image_ref = photo
+                        else:
+                            self.media_lbl.configure(text="🎬 Video File\n(Could not read frame)")
+                    else:
+                        self.media_lbl.configure(text="🎬 Video File\n(Could not open video file)")
+                except Exception as e:
+                    self.media_lbl.configure(text=f"🎬 Video File\n(Frame extract error:\n{e})")
             else:
-                if not PIL_AVAILABLE and ext not in {".png", ".gif"}:
-                    self.media_lbl.configure(text="[Preview available after installing PIL/Pillow]")
-                else:
-                    self.media_lbl.configure(text="Unable to load image preview")
-                    
+                self.media_lbl.configure(text="🎬 Video File\n(Install opencv-python for frame preview)")
+                
         elif ext in text_exts:
-            # Load text snippet
             try:
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                     snippet = "".join([f.readline() for _ in range(12)])
@@ -865,21 +935,14 @@ class ResultsScreen(ttk.Frame):
                 self.snippet_text.insert(tk.END, snippet)
                 self.snippet_text.configure(state="disabled")
                 
-                # Show Snippet panel
                 self.media_lbl.configure(text="📝 Text Document")
                 self.snippet_lbl.pack(after=self.media_frame, anchor="w", pady=(0, 2))
                 self.snippet_frame.pack(after=self.snippet_lbl, fill="x", pady=(0, 5))
             except Exception:
                 pass
-                
-        elif ext in {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv"}:
-            self.media_lbl.configure(text="🎬 Video File\n(Preview not supported)")
-        elif ext in {".mp3", ".wav", ".ogg", ".flac", ".m4a"}:
-            self.media_lbl.configure(text="🎵 Audio File\n(Preview not supported)")
         else:
             self.media_lbl.configure(text="📄 Binary / Resource File")
 
-        # Re-apply theme configuration to the newly loaded/created widgets
         self.controller._apply_theme_to_widget_tree(self.preview_pane, self.controller.palette)
 
     def select_all_but_one(self, keep="oldest"):
@@ -893,12 +956,14 @@ class ResultsScreen(ttk.Frame):
                 
             file_meta = []
             for child_id in children:
-                filepath = self.tree.item(child_id, "tags")[0]
-                try:
-                    mtime = os.path.getmtime(filepath)
-                except Exception:
-                    mtime = 0
-                file_meta.append((child_id, filepath, mtime))
+                vals = self.tree.item(child_id, "values")
+                if len(vals) > 3:
+                    filepath = vals[3]
+                    try:
+                        mtime = os.path.getmtime(filepath)
+                    except Exception:
+                        mtime = 0
+                    file_meta.append((child_id, filepath, mtime))
                 
             file_meta.sort(key=lambda x: x[2])
             
@@ -909,9 +974,16 @@ class ResultsScreen(ttk.Frame):
                 keep_item = file_meta[-1]
                 delete_items = file_meta[:-1]
                 
-            self.tree.set(keep_item[0], "status", "[ ]")
+            vals_keep = list(self.tree.item(keep_item[0], "values"))
+            if len(vals_keep) > 2:
+                vals_keep[2] = "☐"
+            self.tree.item(keep_item[0], values=vals_keep, tags=("unchecked",))
+            
             for item in delete_items:
-                self.tree.set(item[0], "status", "[x]")
+                vals_del = list(self.tree.item(item[0], "values"))
+                if len(vals_del) > 2:
+                    vals_del[2] = "☑"
+                self.tree.item(item[0], values=vals_del, tags=("checked",))
                 self.controller.selected_files.add(item[1])
                 
         self.update_delete_button_state()
@@ -922,7 +994,10 @@ class ResultsScreen(ttk.Frame):
         for header_id in root_items:
             children = self.tree.get_children(header_id)
             for child_id in children:
-                self.tree.set(child_id, "status", "[ ]")
+                vals = list(self.tree.item(child_id, "values"))
+                if len(vals) > 2:
+                    vals[2] = "☐"
+                self.tree.item(child_id, values=vals, tags=("unchecked",))
         self.update_delete_button_state()
 
     def delete_selected(self):
@@ -943,7 +1018,6 @@ class ResultsScreen(ttk.Frame):
         if success:
             messagebox.showinfo("Success", f"{count} files were successfully sent to the Recycle Bin.")
             
-            # Update scan results model
             for filepath in selected:
                 for group in self.controller.scan_results:
                     if filepath in group['files']:

@@ -35,18 +35,11 @@ def send_to_recycle_bin(paths) -> bool:
     if not paths:
         return True
 
-    # Windows-only ctypes integration
     if sys.platform != 'win32':
-        # Fallback for non-Windows (if any, though this app is Windows-focused)
-        # We will just delete permanently as fallback or fail gracefully.
         return False
 
     try:
-        # Convert all paths to absolute paths with backslashes
         abs_paths = [os.path.abspath(p).replace('/', '\\') for p in paths]
-        
-        # Double-null-terminated string: each path is separated by a single null byte,
-        # and the entire sequence is terminated by two null bytes.
         p_from = "\0".join(abs_paths) + "\0\0"
         
         fileop = SHFILEOPSTRUCTW()
@@ -60,7 +53,6 @@ def send_to_recycle_bin(paths) -> bool:
         fileop.lpszProgressTitle = None
 
         result = windll.shell32.SHFileOperationW(byref(fileop))
-        # SHFileOperation returns 0 if successful, non-zero otherwise.
         return result == 0
     except Exception:
         return False
@@ -78,3 +70,16 @@ def format_size(size_in_bytes: int) -> str:
             return f"{size_in_bytes:.2f} {unit}"
         size_in_bytes /= 1024.0
     return f"{size_in_bytes:.2f} PB"
+
+def get_windows_system_theme() -> str:
+    """Queries the Windows registry to check if Dark Mode is active."""
+    if sys.platform != 'win32':
+        return "dark"
+    try:
+        import winreg
+        registry = winreg.ConnectRegistry(None, winreg.HKEY_CURRENT_USER)
+        key = winreg.OpenKey(registry, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        return "light" if value == 1 else "dark"
+    except Exception:
+        return "dark"  # Default fallback

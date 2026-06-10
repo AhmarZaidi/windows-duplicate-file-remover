@@ -1,5 +1,4 @@
-import sys
-from gui import MainWindow
+from duplicate_remover.gui import MainWindow
 
 def main():
     # Set Windows Process DPI Awareness so that the GUI fonts and widgets

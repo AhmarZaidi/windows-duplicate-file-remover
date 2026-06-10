@@ -5,7 +5,7 @@ import queue
 import unittest
 import ctypes
 
-from duplicate_finder import DuplicateFinderEngine, is_hidden_or_system
+from duplicate_remover.duplicate_finder import DuplicateFinderEngine, is_hidden_or_system
 
 class TestDuplicateFinder(unittest.TestCase):
     def setUp(self):
