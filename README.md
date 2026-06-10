@@ -1,62 +1,33 @@
 # Windows Duplicate File Remover
 
-A modern, fast, and accurate Windows desktop utility to scan a directory recursively, identify duplicate files of all types, preview matched contents, and safely delete files via Windows Recycle Bin integration. 
-
-Built using Python's standard libraries, styled to match Windows 11 Fluent design principles, and enhanced with image and video frame previews.
-
----
-
-## Key Features
-
-1. **Multi-Pass Comparison Engine**:
-   - Compares files based on **size**, **partial hash** (first 8KB), and **full content hash** (MD5) to instantly identify matching byte structures.
-   - Skips unique files early in the pipeline to avoid redundant I/O, ensuring lightning-fast scans even across tens of thousands of files.
-2. **Windows 11 Fluent UI Design**:
-   - Modern dark/light/system theme support with a horizontal segmented 3-state toggle button.
-   - Dynamically drawn canvas-based rounded buttons that change states on hover and click.
-   - Windows 11 styled list view with real checkboxes and soft row-highlight states (`#e0f2fe` for light mode, `#2a3a4e` for dark mode).
-   - Visually distinguished group dividers for clear separator rows, fully keyboard navigable.
-3. **Advanced Collapsable Preview Pane**:
-   - **Images**: Renders scaled thumbnails of all formats (PNG, JPG, BMP, WEBP, GIF, etc.) using Pillow.
-   - **Videos**: Automatically extracts frame previews (at roughly the 1-second mark) for video formats (MP4, MKV, AVI, MOV, etc.) using OpenCV.
-   - **Text Files**: Displays a scrollable read-only preview of the first 12 lines of text.
-   - **Scrollable Details**: The entire right pane is scrollable, preventing element clipping on small displays.
-4. **Path Differentiation**:
-   - Calculates the longest common path base for each duplicate group.
-   - Displays the common path in the group header, and shows only the relative differences in the child items, reducing visual clutter.
-5. **Safe Native Deletions**:
-   - Integrates with the Windows shell API via `ctypes` (`shell32.dll`) to send deleted files directly to the native Windows Recycle Bin, allowing files to be recovered if deleted by mistake.
+<!-- [![Windows Duplicate File Remover Screenshot](screenshot.png)](#) -->
+*A modern, fast, and accurate Windows desktop utility to scan, find, preview, and safely delete duplicate files.*
 
 ---
 
-## Project Structure
+## 🚀 Key Features
 
-```
-windows_duplicate_remover/
-├── duplicate_remover/
-│   ├── __init__.py
-│   ├── duplicate_finder.py  # Optimized hashing engine (background thread)
-│   ├── gui.py               # Tkinter GUI (custom widgets, theme toggles, preview)
-│   └── utils.py             # Recycle Bin ctypes integration, size formatters
-├── main.py                  # DPI-aware entry point
-├── tests.py                 # Core unit tests (runs matching accuracy tests)
-├── requirements.txt         # Package dependencies (Pillow, OpenCV, PyInstaller)
-├── build_exe.py             # Packaging automation script
-└── README.md                # Documentation (this file)
-```
+* **Multi-Pass Scan Engine**: Fast comparison using file size $\rightarrow$ partial hash (8 KB) $\rightarrow$ full MD5 hash.
+* **Scan Customization**: Filter by minimum file size (Bytes/KB/MB/GB) and exclude folders (e.g. `node_modules`, `.git`).
+* **Windows 11 UI Style**: 3-state Theme Toggle (Light/Dark/System), custom checkboxes, row highlighting, and group headers.
+* **Smart Quick Select**: One-click selection options (Keep Oldest, Keep Newest, Keep Largest, Keep Smallest, Clear Selection).
+* **Collapsible Preview Pane**: View image thumbnails, video keyframes (via OpenCV), and text file snippets.
+* **Compact Path Display**: Shows the common directory base in the group header, displaying only the relative diff path per file.
+* **Safe Deletion**: Deletes files using the native Windows shell API, sending them directly to the **Recycle Bin**.
+* **Data Export**: Export scanning results to CSV or JSON.
 
 ---
 
-## Prerequisites
+## 📥 Usage
 
-Ensure you have Python 3.8 or higher installed on your Windows machine.
+### Option 1: Standalone Portable Executable (Recommended)
+1. Go to [Releases](https://github.com/AhmarZaidi/windows-duplicate-file-remover/releases/latest).
+2. Download the latest `DuplicateRemover.exe`.
+3. Double-click to run! (No Python or installation required).
 
----
-
-## Installation & Running
-
-1. Open your terminal in the project directory.
-2. Install the required external libraries:
+### Option 2: Run from Source
+1. Clone this repository and open the project directory.
+2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
@@ -67,23 +38,29 @@ Ensure you have Python 3.8 or higher installed on your Windows machine.
 
 ---
 
-## Building a Standalone Executable (`.exe`)
+## 🛠️ Build and Development
 
-You can compile the application into a single, console-less, portable executable file using PyInstaller.
+### Compile to EXE
+To build the standalone portable executable yourself:
+```bash
+python build_exe.py
+```
+The compiled artifact will be located at `dist/DuplicateRemover.exe`.
 
-1. Run the build automation script:
-   ```bash
-   python build_exe.py
-   ```
-2. Once the script finishes compiling, your portable executable will be located in:
-   `dist/DuplicateRemover.exe`
-3. You can copy `DuplicateRemover.exe` to any folder or system, and run it independently without needing Python or external libraries installed!
+### Run Unit Tests
+To run the scanning engine test suite:
+```bash
+python -m unittest tests.py
+```
 
 ---
 
-## Running Unit Tests
+## 📂 Project Layout
 
-To run the automated test suite verifying duplicate logic and file metric conditions:
-```bash
-python tests.py
-```
+* `duplicate_remover/`
+  * `duplicate_finder.py`: Hashing and matching engine (runs in a background thread).
+  * `gui.py`: Tkinter-based Windows 11 style UI, preview generation, and widget trees.
+  * `utils.py`: Recycle Bin integration (`ctypes`) and file formatters.
+* `main.py`: DPI-aware application entry point.
+* `build_exe.py`: Spec compilation and PyInstaller build automate.
+* `tests.py`: Unit tests for matching accuracy.
